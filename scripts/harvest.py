@@ -1,5 +1,5 @@
-# scripts/harvest.py — full rewrite with hard time budget + tuned concurrency
-# pip install aiohttp aiofiles pysocks
+# scripts/harvest.py — full file, fixed validate functions
+# python 3.12 broke tasks[coro] lookup in as_completed — use asyncio.gather instead
 
 import asyncio
 import aiohttp
@@ -12,11 +12,11 @@ from pathlib import Path
 
 # ─── tuning ──────────────────────────────────────────────────────────────────
 
-TIMEOUT_SEC    = 5        # per-proxy timeout (down from 8)
-CONCURRENCY    = 600      # simultaneous checks (up from 300)
-HARD_BUDGET    = 18 * 60  # 18 min wall-clock max for validation phase
-TARGET_URL     = "https://login.live.com"
-OUT_DIR        = Path("proxies")
+TIMEOUT_SEC   = 5
+CONCURRENCY   = 600
+HARD_BUDGET   = 18 * 60
+TARGET_URL    = "https://login.live.com"
+OUT_DIR       = Path("proxies")
 
 # ─── sources ─────────────────────────────────────────────────────────────────
 
@@ -143,7 +143,6 @@ async def harvest(sources: list[str]) -> set[tuple[str, int]]:
 # ─── validate ────────────────────────────────────────────────────────────────
 
 LEAK_HEADERS = {"x-forwarded-for", "via", "x-real-ip", "forwarded", "x-proxy-id"}
-
 sem = asyncio.Semaphore(CONCURRENCY)
 
 async def check_http(session: aiohttp.ClientSession, ip: str, port: int) -> bool:
@@ -182,45 +181,41 @@ async def check_socks(ip: str, port: int, version: int) -> bool:
         return await loop.run_in_executor(None, _socks_check_sync, ip, port, version)
 
 # ─── batched validation with hard time budget ────────────────────────────────
+# fix: use asyncio.gather in chunks instead of tasks[coro] pattern
+# python 3.12 as_completed returns awaitables not futures — dict lookup breaks
+
+async def validate_in_chunks(coros, deadline: float) -> list[bool]:
+    chunk = 2000
+    results = []
+    items = list(coros)
+    for i in range(0, len(items), chunk):
+        if time.monotonic() > deadline:
+            print("  [!] budget hit — stopping early")
+            remaining = len(items) - i
+            results.extend([False] * remaining)
+            break
+        batch = items[i:i + chunk]
+        batch_results = await asyncio.gather(*batch, return_exceptions=True)
+        results.extend(
+            r if isinstance(r, bool) else False
+            for r in batch_results
+        )
+    return results
 
 async def validate_http_list(proxies: set[tuple[str,int]], deadline: float) -> list[tuple[str,int]]:
+    proxy_list = list(proxies)
     conn = aiohttp.TCPConnector(limit=CONCURRENCY, ssl=False)
     headers = {"User-Agent": "Mozilla/5.0"}
-    good = []
     async with aiohttp.ClientSession(connector=conn, headers=headers) as session:
-        tasks = {asyncio.ensure_future(check_http(session, ip, port)): (ip, port)
-                 for ip, port in proxies}
-        for coro in asyncio.as_completed(tasks):
-            if time.monotonic() > deadline:
-                print("  [!] http budget hit — stopping early")
-                for t in tasks:
-                    t.cancel()
-                break
-            proxy = tasks[coro]
-            try:
-                if await coro:
-                    good.append(proxy)
-            except Exception:
-                pass
-    return good
+        coros = [check_http(session, ip, port) for ip, port in proxy_list]
+        results = await validate_in_chunks(coros, deadline)
+    return [proxy_list[i] for i, ok in enumerate(results) if ok]
 
 async def validate_socks_list(proxies: set[tuple[str,int]], version: int, deadline: float) -> list[tuple[str,int]]:
-    good = []
-    tasks = {asyncio.ensure_future(check_socks(ip, port, version)): (ip, port)
-             for ip, port in proxies}
-    for coro in asyncio.as_completed(tasks):
-        if time.monotonic() > deadline:
-            print(f"  [!] socks{version} budget hit — stopping early")
-            for t in tasks:
-                t.cancel()
-            break
-        proxy = tasks[coro]
-        try:
-            if await coro:
-                good.append(proxy)
-        except Exception:
-            pass
-    return good
+    proxy_list = list(proxies)
+    coros = [check_socks(ip, port, version) for ip, port in proxy_list]
+    results = await validate_in_chunks(coros, deadline)
+    return [proxy_list[i] for i, ok in enumerate(results) if ok]
 
 # ─── write ───────────────────────────────────────────────────────────────────
 
@@ -244,20 +239,19 @@ async def main():
     )
     print(f"[*] raw — http:{len(http_raw)}  socks4:{len(s4_raw)}  socks5:{len(s5_raw)}")
 
-    # split budget: http gets half, socks4+socks5 share the other half
     validate_start = time.monotonic()
-    http_deadline   = validate_start + HARD_BUDGET * 0.45
-    s4_deadline     = validate_start + HARD_BUDGET * 0.72
-    s5_deadline     = validate_start + HARD_BUDGET * 0.99
+    http_deadline  = validate_start + HARD_BUDGET * 0.45
+    s4_deadline    = validate_start + HARD_BUDGET * 0.72
+    s5_deadline    = validate_start + HARD_BUDGET * 0.99
 
     print("[*] validating http...")
-    elite_http  = await validate_http_list(http_raw, http_deadline)
+    elite_http = await validate_http_list(http_raw, http_deadline)
 
     print("[*] validating socks4...")
-    elite_s4    = await validate_socks_list(s4_raw,  4, s4_deadline)
+    elite_s4   = await validate_socks_list(s4_raw, 4, s4_deadline)
 
     print("[*] validating socks5...")
-    elite_s5    = await validate_socks_list(s5_raw,  5, s5_deadline)
+    elite_s5   = await validate_socks_list(s5_raw, 5, s5_deadline)
 
     print(f"[*] elite — http:{len(elite_http)}  socks4:{len(elite_s4)}  socks5:{len(elite_s5)}")
 
@@ -267,7 +261,6 @@ async def main():
         write_list(OUT_DIR / "socks5.txt", elite_s5),
         write_list(OUT_DIR / "all.txt",    list(set(elite_http)|set(elite_s4)|set(elite_s5))),
     )
-
     print(f"[*] done in {time.monotonic()-t0:.1f}s")
 
 if __name__ == "__main__":
